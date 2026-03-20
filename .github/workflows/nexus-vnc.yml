@@ -1,0 +1,179 @@
+name: Nexus macOS VNC Deployment
+on: 
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.github/workflows/nexus-vnc.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: macos-latest
+    timeout-minutes: 360
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v3
+      
+    - name: Setup Environment
+      run: |
+        echo "[INFO] OS: macos-latest (macOS 14+)"
+        echo "[INFO] Protocol: VNC (TigerVNC)"
+        echo "[INFO] Port: 5900"
+        echo "[INFO] Visibility: PUBLIC"
+        
+    - name: Install Dependencies
+      run: |
+        brew update
+        brew install ngrok tiger-vnc
+        brew link --overwrite tiger-vnc || true
+        
+    - name: Configure Ngrok
+      run: ngrok config add-authtoken 3A1U8v4Hgshl3u7YbgmbDwX557U_2qkyufwhBM51Z3fXnhBjv
+
+    - name: Start TigerVNC Server
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.vnc"
+        chmod 700 "$HOME/.vnc"
+        echo "[INFO] Creating VNC password file..."
+        python3 -c "
+        import struct, os, sys
+        pw = 'Sinket@1'.ljust(8, chr(0))[:8]
+        key = [0]*8
+        for i,c in enumerate(bytearray(pw.encode('latin-1'))):
+            key[i] = ((c >> 1) & 0x55) | ((c << 1) & 0xAA) & 0xFF
+        with open(os.path.expanduser('~/.vnc/passwd'), 'wb') as f:
+            f.write(bytes(key))
+        print('[INFO] VNC password file created via Python DES-obfuscation')
+        "
+        chmod 600 "$HOME/.vnc/passwd"
+        TIGER_PREFIX="$(brew --prefix tiger-vnc 2>/dev/null || true)"
+        VNC_BIN=""
+        for candidate in           "$(command -v Xvnc || true)"           "$TIGER_PREFIX/bin/Xvnc"           "$TIGER_PREFIX/sbin/Xvnc"           "/opt/homebrew/opt/tiger-vnc/bin/Xvnc"           "/usr/local/opt/tiger-vnc/bin/Xvnc"; do
+          if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+            VNC_BIN="$candidate"
+            break
+          fi
+        done
+
+        if [ -z "$VNC_BIN" ] && [ -n "$TIGER_PREFIX" ] && [ -d "$TIGER_PREFIX" ]; then
+          VNC_BIN="$(python3 -c "
+import glob
+import os
+
+prefix = '$TIGER_PREFIX'
+cands = glob.glob(prefix + '/**/Xvnc', recursive=True)
+cands = [c for c in cands if os.access(c, os.X_OK)]
+print(cands[0] if cands else '')
+")"
+        fi
+
+        if [ -z "$VNC_BIN" ]; then
+          echo "[ERROR] Xvnc binary not found after tiger-vnc install"
+          echo "[INFO] brew --prefix tiger-vnc => $TIGER_PREFIX"
+          ls -la "$TIGER_PREFIX" || true
+          ls -la "$TIGER_PREFIX/bin" || true
+          ls -la /opt/homebrew/opt/tiger-vnc/bin || true
+          ls -la /usr/local/opt/tiger-vnc/bin || true
+          exit 1
+        fi
+        echo "[INFO] Using Xvnc binary: $VNC_BIN"
+        echo "[INFO] Launching headless VNC server on :1 (port 5900)..."
+        "$VNC_BIN" :1 \
+          -rfbport 5900 \
+          -geometry 1920x1080 \
+          -depth 24 \
+          -localhost no \
+          -SecurityTypes VncAuth \
+          -PasswordFile "$HOME/.vnc/passwd" \
+          -AlwaysShared=1 \
+          > "$HOME/.vnc/xvnc.log" 2>&1 &
+        for i in $(seq 1 20); do
+          if nc -z 127.0.0.1 5900; then
+            break
+          fi
+          sleep 1
+        done
+        if ! nc -z 127.0.0.1 5900; then
+          echo "[ERROR] VNC server failed to open port 5900"
+          tail -n 120 "$HOME/.vnc/xvnc.log" || true
+          exit 1
+        fi
+        echo "[SUCCESS] TigerVNC is running on port 5900"
+
+    - name: Verify VNC Protocol
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 -c "
+        import socket, sys
+        sock = socket.create_connection(('127.0.0.1', 5900), timeout=5)
+        banner = sock.recv(12).decode('ascii', 'ignore').strip()
+        sock.close()
+        print(f'[INFO] VNC banner: {banner}')
+        if not banner.startswith('RFB 003.'):
+            print('[ERROR] Invalid VNC protocol banner')
+            sys.exit(1)
+        print('[SUCCESS] VNC protocol handshake valid')
+        "
+
+    - name: Establish Tunnel
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "[INFO] Starting Ngrok tunnel on port 5900..."
+        ngrok tcp 5900 > /tmp/ngrok.log 2>&1 &
+        for i in $(seq 1 30); do
+          if curl -sf http://127.0.0.1:4040/api/tunnels > /tmp/tunnels.json 2>/dev/null; then
+            break
+          fi
+          sleep 1
+        done
+        if [ ! -s /tmp/tunnels.json ]; then
+          echo "[ERROR] Ngrok tunnel metadata not available"
+          cat /tmp/ngrok.log || true
+          exit 1
+        fi
+        TUNNEL_URL=$(python3 -c "
+        import json
+        with open('/tmp/tunnels.json', 'r') as f:
+            data = json.load(f)
+        for t in data.get('tunnels', []):
+            u = t.get('public_url', '')
+            if u.startswith('tcp://'):
+                print(u)
+                break
+        ")
+        if [ -z "$TUNNEL_URL" ]; then
+          echo "[ERROR] Failed to extract tcp tunnel URL"
+          cat /tmp/tunnels.json
+          exit 1
+        fi
+        echo "========================================"
+        echo "VNC Address: $TUNNEL_URL"
+        echo "Username: <LEAVE THIS BLANK IN VNC VIEWER>"
+        echo "Password: Sinket@1"
+        echo "Fallback User (if client asks): admin_sk"
+        echo "========================================"
+        
+    - name: Keep Alive
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "[INFO] Session active for 6 hours max..."
+        for i in $(seq 360 -1 1); do
+          if ! pgrep -f "Xvnc :1" > /dev/null; then
+            echo "[ERROR] Xvnc process stopped unexpectedly"
+            tail -n 120 "$HOME/.vnc/xvnc.log" || true
+            exit 1
+          fi
+          if ! pgrep -f "ngrok tcp 5900" > /dev/null; then
+            echo "[ERROR] Ngrok process stopped unexpectedly"
+            cat /tmp/ngrok.log || true
+            exit 1
+          fi
+          echo "Time remaining: $i minutes"
+          sleep 60
+        done
